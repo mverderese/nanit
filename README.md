@@ -1,131 +1,66 @@
-# blAIr
+# nanit-mcp
 
-Better sleep scoring and AI insights for Nanit baby monitors.
+A small, stateless [MCP](https://modelcontextprotocol.io) server that gives Claude **read-only** access to your
+[Nanit](https://www.nanit.com) baby monitor's sleep data, plus deterministic sleep scoring. No AI provider,
+no video, no audio, no database.
 
-The official Nanit app often misses when a baby actually falls asleep or wakes for the day, and its sleep score doesn't account for what's normal at a given (adjusted) age. blAIr signs into your Nanit account, pulls the same sleep data, and re-scores it:
+The scoring math (night windows, wake classification, 0-100 score, milestones, regression alerts) is ported
+from [mlevitin-create/blair](https://github.com/mlevitin-create/blair), the fork this repo started from. That
+fork's web app is gone from this repo; its history and code remain at the link above.
 
-- **Age-adjusted scoring** (duration, continuity, longest stretch, bedtime timing) with prematurity taken into account. Expected night wakes are free; only extra or unusually long ones cost points. A "why this score?" breakdown shows the math.
-- **Self-settled vs. parent visits.** Nanit's camera logs when a parent approaches the crib. Each night wake is labeled self-settled, parent visit, or taken out (you can correct it). Self-settled wakes never count as extra wakes, brief ones don't break the longest stretch, and the AI won't tell you to "wait before responding" to a wake nobody responded to.
-- **Naps and 24-hour view.** A day-by-day activity chart of every crib sleep (like Nanit's Activity Tracker) with nap count, daytime sleep, and wake windows against age-typical ranges. Naps outside the crib are invisible to the camera, so suspicious wake windows are flagged rather than averaged.
-- **Manual night correction.** Set the real fall-asleep and wake times when Nanit gets them wrong; score, timeline, trends, alerts, and AI writeups all use the corrected window.
-- **AI insights** per night that reference your actual numbers, compare against recent nights, and read the camera thumbnails from that night. Choose Claude or OpenAI for insights, two-night comparison, schedule optimization, and video analysis.
-- **Baby profile** (rolls both ways, sleep sack, pacifier, notes) so the AI stops flagging things that are normal for your baby.
-- Trend charts, regression alerts, milestones, and cry-type classification from clip audio (Gemini).
+## How it works
 
-Live instance: https://blair-1077711142130.us-central1.run.app
+- Each user signs in with their **own Nanit account** (including MFA) on this server's sign-in page.
+- Every OAuth artifact is an AES-256-GCM sealed token under `TOKEN_SECRET`; the server stores nothing.
+- Tools never take a token as a parameter. They derive the Nanit session from the caller's own sealed bearer
+  token, and a `baby_uid` is accepted only after confirming it is on that caller's Nanit account.
 
-It uses Nanit's unofficial API (the same one the Home Assistant integrations use) and can break without warning if Nanit changes it. Not affiliated with Nanit.
+## Tools (all read-only)
 
-## How your data is handled
+| Tool | What it returns |
+|---|---|
+| `list_babies` | Babies on the account |
+| `get_sleep_score` | Score + breakdown for a night (`date`, or `start`/`end`) |
+| `get_sleep_trend` | Per-night scores for the last N nights |
+| `get_sleep_days` | Nights + crib naps, wake windows, 24h totals |
+| `get_milestones` | Records, streaks, improvements |
+| `get_regression_alerts` | Worsening sleep patterns |
+| `get_care_events` | Feeds, diaper changes, other non-sleep events |
+| `get_sensor_events` | Sound / motion / temperature alerts |
 
-- Your Nanit email and password are sent to Nanit's API to obtain a session token. The backend does not store credentials; the token lives in your browser's localStorage.
-- Stored server-side (Firestore or SQLite): your sleep settings and baby profile, manual night corrections, raw sleep segments for completed nights (as a cache), the AI text generated for a night, and feedback you submit. No video or images are stored.
-- AI calls are capped per baby per day.
+Scoring tools take optional `timezone`, `birthdate` (defaults to Nanit's), `premature_weeks`, `bedtime_hour`
+and `wake_hour`. Manual night corrections and stored baby profiles are intentionally not supported: they would
+need server-side state.
 
-## Architecture
-
-```
-frontend/   React 19 + Vite + Tailwind 4     -> built to static files
-backend/    Express + TypeScript             -> serves the API and the built frontend
-            services/nanit-client.ts          Nanit API (reverse-engineered)
-            services/sleep-scorer.ts          scoring + manual annotations
-            services/night-history.ts         cached, parallel multi-night loader
-            services/ai.ts                    provider-neutral structured AI interface
-            services/claude.ts                Claude adapter
-            services/openai-adapter.ts        OpenAI adapter
-            services/ai-insights.ts, night-comparison.ts, schedule-optimizer.ts,
-            services/video-patterns.ts, video-analysis.ts, audio-analysis.ts
-Dockerfile  multi-stage build for Cloud Run (includes ffmpeg)
-```
-
-## Running locally
-
-Requirements: Node 22+. The default Firestore backend needs a Google Cloud project with a Firestore database named `blair` and application default credentials. For SQLite, use the Docker Compose setup below.
+## Run locally
 
 ```bash
-cd backend && npm install
-cd ../frontend && npm install
+npm install
+cp .env.example .env   # set TOKEN_SECRET
+TOKEN_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('base64'))") \
+  PUBLIC_BASE_URL=http://127.0.0.1:8000 npm run dev
+claude mcp add --transport http nanit http://127.0.0.1:8000/mcp
 ```
 
-Create `backend/.env`:
+## Deploy (Vercel)
 
-```
-PORT=8080
-STORAGE_BACKEND=firestore   # default; use sqlite for self-hosting
-FIREBASE_PROJECT_ID=your-gcp-project
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=                 # optional; use when BLAIR_AI_PROVIDER=openai
-GEMINI_API_KEY=...            # optional, only for audio analysis
-BLAIR_AI_PROVIDER=anthropic   # optional: anthropic | openai; defaults to anthropic
-BLAIR_AI_MODEL=claude-opus-5  # optional; OpenAI defaults to gpt-6-luna
-BLAIR_AI_EFFORT=medium        # optional; OpenAI also supports none
-AI_DAILY_LIMIT_PER_BABY=40    # optional
-AI_DAILY_LIMIT_GLOBAL=400     # optional
-ALLOWED_EMAILS=               # optional comma-separated Nanit emails; empty = anyone
-RESEND_API_KEY=               # optional, emails feedback submissions
-FEEDBACK_TO_EMAIL=            # where feedback goes
-```
+Set `TOKEN_SECRET` (required) and optionally `PUBLIC_BASE_URL` / `DEFAULT_TIMEZONE`. Leave Deployment
+Protection off for the production domain so Claude can reach it. Then add `https://<your-domain>/mcp` as a custom
+connector in Claude. Rotate secrets by prepending a new one to `TOKEN_SECRET` (comma-separated); removing the
+old one signs everyone out.
 
-The provider, model, and effort settings form one global configuration triple for all text and image analyses. Use a model supported by the selected provider:
+## Security notes
 
-| Provider | Model | Effort | Example |
-| --- | --- | --- | --- |
-| `anthropic` | `claude-opus-5` | `medium` | Existing default |
-| `openai` | `gpt-6-luna` | `none` | Lowest reasoning effort |
-| `openai` | `gpt-6-luna` | `medium` | OpenAI default effort |
-| `openai` | `gpt-6-sol` | `medium` | More capable OpenAI option |
+- The MFA step carries the password through the browser as an AES-GCM sealed blob (5 min TTL, bound to the
+  authorization request). It is the most sensitive point; review `src/oauth.ts` (`mfaBlob`).
+- Redirect URIs are limited to Claude's callbacks and loopback (`ALLOW_LOOPBACK_REDIRECTS=false` disables loopback).
+  PKCE is required, codes live 5 minutes, access tokens 30 minutes.
+- Stateless limits: codes can be replayed within their TTL (still needs the PKCE verifier), and there is no
+  revocation endpoint because Nanit has no way to revoke a refresh token. Rotating `TOKEN_SECRET` invalidates everything.
+- The sign-in page sets `Cache-Control: no-store`, a strict CSP, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`.
 
-Set the matching key (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). OpenAI requests use the configured model without automatic fallback. Anthropic retains its existing server-side fallback behavior to recover from false-positive refusals.
-
-Then in two terminals:
+## Test
 
 ```bash
-cd backend && npm run dev      # http://localhost:8080
-cd frontend && npm run dev     # http://localhost:3000 (proxies /api to 8080)
+npm test
 ```
-
-`ffmpeg` must be on your PATH for clip frame extraction and audio analysis; the Docker image installs it.
-
-## Self-hosting with SQLite
-
-Docker Compose runs blAIr with SQLite and does not require a Google Cloud project. The default setup builds a local image for your host architecture. From the repository directory:
-
-```bash
-cp .env.example .env
-# Edit .env: set ALLOWED_EMAILS and the API key for your selected AI provider; GEMINI_API_KEY is optional.
-docker compose up -d --build
-```
-
-Open `http://YOUR_SERVER_IP:8080`. The app uses your Nanit login through your own server. Your AI keys stay in the container environment; Your configured AI provider handles text/image analysis, and Gemini handles optional audio analysis. API usage is billed to your accounts. The default daily limits are 40 calls per baby and 400 total, and can be changed in `.env`. Serve the app over HTTPS or a private VPN when accessing it beyond the server itself.
-
-The database is `/data/blair.db` in the container, bind-mounted to `./data` on the host. Run one blAIr container per SQLite database. To update a local build, pull the latest source and run `docker compose up -d --build`. To back up, stop the container with `docker compose stop`, copy the entire `./data` directory to your backup location, then run `docker compose start`. To restore, stop the container, replace `./data` with your saved copy, and start it again. Stopping before copying keeps the SQLite WAL files consistent.
-
-To use a published image instead, set `BLAIR_IMAGE=ghcr.io/<owner>/<repo>:latest` in `.env`, replacing `<owner>/<repo>` with the repository that publishes it, then run `docker compose pull && docker compose up -d --no-build`. Repeat that command to update. Use a branch, `sha-...`, or release tag to select a specific build. Published images currently target Linux amd64; ARM hosts should use the local build.
-
-To use Firestore on a self-hosted server, set `STORAGE_BACKEND=firestore` in your own Compose override or Docker run command, configure `FIREBASE_PROJECT_ID`, and mount Google application default credentials. The included Compose file selects SQLite. Storage backends do not sync data; switching from one to another starts with a separate dataset. The SQLite driver is an optional dependency so its installation cannot block Firestore deployments. SQLite deployments still require it; do not omit optional dependencies when installing for SQLite.
-
-The original hosted deployment keeps its existing Google Analytics measurement ID without any build change. Analytics is disabled automatically in local frontend development. The self-hosted Compose deployment sets `DISABLE_ANALYTICS=true`; any container can set that variable at runtime to hide the consent controls and prevent GA requests, without rebuilding. When the variable is unset or false, GA remains available subject to user consent. To use a different measurement ID, set `VITE_GA_MEASUREMENT_ID` when building the frontend. The measurement ID is public, but AI keys remain server-side.
-
-## Container CI
-
-Pushes to `main` and `v*` version tags publish images to `ghcr.io/<owner>/<repo>`. Manual workflow runs can also publish the selected ref. Published images include the branch tag (for branch builds) and a `sha-<short-sha>` tag; the default branch also publishes `latest`. Other branch pushes do not publish images. Version tags publish the full version, major/minor tags, and `latest`. Pull requests run tests and build a Linux amd64 image without publishing. Publishing to Docker Hub is optional: add the `DOCKERHUB_TOKEN` repository secret. The username and image default to the GitHub repository owner and `<owner>/<repo>`; set the `DOCKERHUB_USERNAME` and `DOCKERHUB_IMAGE` repository variables if your Docker Hub account or image name differs. Create the Docker Hub repository first and use an access token for its account. Both registries publish Linux amd64 images.
-
-## Deploying to Cloud Run
-
-```bash
-gcloud run deploy blair --source . --project YOUR_PROJECT --region us-central1
-```
-
-Set the environment variables above on the service (they persist across deploys). Firestore is reached through the service's default credentials.
-
-## Scoring in one paragraph
-
-Nanit `auto_sleep` calendar entries are grouped into nights (a gap over 120 minutes starts a new night). The longest night in the window is scored out of 100: duration (35) against the ideal hours for the baby's adjusted age on that night, continuity (35) penalizing only wakes beyond the expected count and minutes beyond the normal wake duration (wakes the baby settled from without a parent visit never count as extra, and running long costs half), longest stretch (15) against an age-based expectation (self-settled wakes of 5 minutes or less don't break a stretch), and timing (15) against an age-based bedtime range widened by your own bedtime setting. Manual corrections clip or extend the detected segments before any of this runs.
-
-## Status
-
-Brand new, built by one parent for one baby, largely vibe-coded with Claude. Bugs and feedback are welcome through the in-app form or GitHub issues.
-
-## License
-
-MIT
