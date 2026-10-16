@@ -1,0 +1,1 @@
+Placeholder so Vercel accepts the output directory. All routes are served by api/index.ts.
