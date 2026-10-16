@@ -42,7 +42,12 @@ function mockNanit(url: string, init?: RequestInit): Response {
       { uid: 'c', baby_uid: 'baby1', type: 'bottle_feed', begin_ts: t, end_ts: t, duration: 0, time: t },
     ] });
   }
-  if (u.pathname === '/babies/baby1/events') return Response.json({ events: [] });
+  if (u.pathname === '/babies/baby1/events') {
+    return Response.json({ events: [
+      { uid: 'e1', key: 'WOKE_UP', time: nightStart + 7200, media_urls: { thumbnail: 'https://signed.example/t.png' } },
+      { uid: 'e2', key: 'VISIT', time: nightStart + 90000 },
+    ] });
+  }
   return new Response('{}', { status: 404 });
 }
 
@@ -154,7 +159,7 @@ test('full flow: DCR, authorize, MFA sign-in, token, tools, refresh', async () =
 
   const list = await (await rpc(tokens.access_token, 'tools/list', {})).json() as any;
   const names = list.result.tools.map((t: any) => t.name).sort();
-  assert.deepEqual(names, ['get_care_events', 'get_milestones', 'get_regression_alerts', 'get_sensor_events', 'get_sleep_days', 'get_sleep_score', 'get_sleep_trend', 'list_babies']);
+  assert.deepEqual(names, ['get_care_events', 'get_milestones', 'get_raw_events', 'get_regression_alerts', 'get_sensor_events', 'get_sleep_days', 'get_sleep_score', 'get_sleep_trend', 'list_babies']);
   assert.ok(list.result.tools.every((t: any) => t.annotations.readOnlyHint === true));
 
   const babies = JSON.parse((await callTool(tokens.access_token, 'list_babies', {})).content[0].text);
@@ -174,6 +179,19 @@ test('full flow: DCR, authorize, MFA sign-in, token, tools, refresh', async () =
   assert.equal(JSON.parse(trend.content[0].text).trend.length, 3);
 });
 
+test('get_raw_events returns calendar + state events, strips media URLs, bounds the range', async () => {
+  const { tokens } = await signIn();
+  const date = pastNightDates(1, tzOffsetMinutes(TZ))[0];
+  const res = await callTool(tokens.access_token, 'get_raw_events', { baby_uid: 'baby1', start: nightStart, end: nightStart + 86400 });
+  assert.ok(!res.isError, res.content?.[0]?.text);
+  const raw = JSON.parse(res.content[0].text);
+  assert.equal(raw.calendar.length, 3);
+  assert.deepEqual(raw.state_events.map((e: any) => e.key), ['WOKE_UP']); // VISIT is outside the window
+  assert.ok(!JSON.stringify(raw).includes('signed.example'));
+  const tooLong = await callTool(tokens.access_token, 'get_raw_events', { baby_uid: 'baby1', start: date, end: '2099-01-01' });
+  assert.equal(tooLong.isError, true);
+});
+
 test('refresh token exchange', async () => {
   const { reg, tokens } = await signIn();
   const r = await realFetch(`${base}/token`, {
@@ -191,8 +209,8 @@ test('refresh token exchange', async () => {
 
 test('baby_uid not on the account is rejected, not served', async () => {
   const { tokens } = await signIn();
-  for (const tool of ['get_sleep_score', 'get_sleep_trend', 'get_sleep_days', 'get_milestones', 'get_regression_alerts', 'get_sensor_events']) {
-    const res = await callTool(tokens.access_token, tool, { baby_uid: 'someone-elses-baby' });
+  for (const tool of ['get_sleep_score', 'get_sleep_trend', 'get_sleep_days', 'get_milestones', 'get_regression_alerts', 'get_sensor_events', 'get_raw_events']) {
+    const res = await callTool(tokens.access_token, tool, { baby_uid: 'someone-elses-baby', start: '2025-01-01', end: '2025-01-02' });
     assert.equal(res.isError, true, tool);
     assert.match(res.content[0].text, /No baby with that baby_uid/);
   }
