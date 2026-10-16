@@ -194,5 +194,29 @@ export function createMcpServer(defaultTimezone: string): McpServer {
       return { messages: types ? messages.filter(m => types.includes(m.type)) : messages };
     });
 
+  tool('get_raw_events', 'Unprocessed Nanit data for a time window: every calendar entry (auto_sleep segments and care events) plus the camera state events (PUT_TO_SLEEP, FELL_ASLEEP, WOKE_UP, VISIT, REMOVED, ...). No scoring or grouping. Max 3 days. State events only reach back about two weeks, and clip/thumbnail URLs are left out.',
+    { baby_uid: babyUid, timezone, start: when, end: when },
+    async (a, c) => {
+      const start = parseWhen(a.start, c.tzOffset, 'start');
+      const end = parseWhen(a.end, c.tzOffset, 'end');
+      if (end <= start || end - start > 3 * 86400) throw new ToolError('end must be after start, within 3 days.');
+      const [{ calendar }, feed] = await Promise.all([
+        nanit.getCalendarEvents(c.session.token, a.baby_uid, start, end),
+        nanit.getEvents(c.session.token, a.baby_uid, 500),
+      ]);
+      const raw = ((feed?.events ?? []) as any[]).filter(e => typeof e.time === 'number');
+      const state_events = raw
+        .filter(e => e.time >= start && e.time <= end)
+        .sort((x, y) => x.time - y.time)
+        // media_urls holds pre-signed video/thumbnail links; this server is data-only
+        .map(({ media_urls: _media, ...rest }) => rest);
+      return {
+        range: { start, end },
+        calendar: [...calendar].sort((x, y) => x.begin_ts - y.begin_ts),
+        state_events,
+        state_events_available_from: raw.length ? Math.min(...raw.map(e => e.time)) : null,
+      };
+    });
+
   return server;
 }
