@@ -39,12 +39,19 @@ function mockNanit(url: string, init?: RequestInit): Response {
     return Response.json({ calendar: [
       { uid: 'a', baby_uid: 'baby1', type: 'auto_sleep', begin_ts: t, end_ts: t + 5 * 3600, duration: 5 * 3600, time: t },
       { uid: 'b', baby_uid: 'baby1', type: 'auto_sleep', begin_ts: t + 5 * 3600 + 600, end_ts: t + 11 * 3600, duration: 6 * 3600 - 600, time: t },
-      { uid: 'c', baby_uid: 'baby1', type: 'bottle_feed', begin_ts: t, end_ts: t, duration: 0, time: t },
+      { uid: 'c', baby_uid: 'baby1', type: 'bottle_feed', begin_ts: t, end_ts: t, duration: 0, time: t, feed_amount: 4, thumbnail_url: 'https://bucket.s3.amazonaws.com/x.png?X-Amz-Signature=1' },
     ] });
   }
   if (u.pathname === '/babies/baby1/events') {
     return Response.json({ events: [
-      { uid: 'e1', key: 'WOKE_UP', time: nightStart + 7200, media_urls: { thumbnail: 'https://signed.example/t.png' } },
+      {
+        uid: 'e1', key: 'WOKE_UP', time: nightStart + 7200, camera_uid: 'cam1', confidence: 0.9,
+        media_urls: { thumbnail: 'https://signed.example/t.png' },
+        raw_videos: { media_segments: [{ video_url: 'https://nanit-clips.s3.amazonaws.com/v.mp4?X-Amz-Security-Token=abc&X-Amz-Signature=def' }] },
+        playlist: { media_segments: [{ video_url: 'https://nanit-clips.s3.us-east-1.amazonaws.com/p.mp4?X-Amz-Credential=xyz' }] },
+        url: 'https://events.nanit.com/e1.mp4', clip_url: 'https://events.nanit.com/e1-clip.mp4',
+        url_updated_at: nightStart, playlist_updated_at: nightStart, clip_generation_status: 'done',
+      },
       { uid: 'e2', key: 'VISIT', time: nightStart + 90000 },
     ] });
   }
@@ -179,7 +186,7 @@ test('full flow: DCR, authorize, MFA sign-in, token, tools, refresh', async () =
   assert.equal(JSON.parse(trend.content[0].text).trend.length, 3);
 });
 
-test('get_raw_events returns calendar + state events, strips media URLs, bounds the range', async () => {
+test('get_raw_events returns calendar + state events, strips signed media links, bounds the range', async () => {
   const { tokens } = await signIn();
   const date = pastNightDates(1, tzOffsetMinutes(TZ))[0];
   const res = await callTool(tokens.access_token, 'get_raw_events', { baby_uid: 'baby1', start: nightStart, end: nightStart + 86400 });
@@ -187,7 +194,10 @@ test('get_raw_events returns calendar + state events, strips media URLs, bounds 
   const raw = JSON.parse(res.content[0].text);
   assert.equal(raw.calendar.length, 3);
   assert.deepEqual(raw.state_events.map((e: any) => e.key), ['WOKE_UP']); // VISIT is outside the window
-  assert.ok(!JSON.stringify(raw).includes('signed.example'));
+  const text = res.content[0].text;
+  for (const leak of ['signed.example', 'amazonaws.com', 'X-Amz', 'events.nanit.com']) assert.ok(!text.includes(leak), `output contains ${leak}`);
+  assert.deepEqual(Object.keys(raw.state_events[0]).sort(), ['camera_uid', 'confidence', 'key', 'time', 'uid']);
+  assert.equal(raw.calendar.find((e: any) => e.uid === 'c').feed_amount, 4); // care fields survive the URL scrub
   const tooLong = await callTool(tokens.access_token, 'get_raw_events', { baby_uid: 'baby1', start: date, end: '2099-01-01' });
   assert.equal(tooLong.isError, true);
 });
