@@ -27,6 +27,14 @@ const when = z.union([z.string().max(40), z.number()]);
 
 const scoring = { baby_uid: babyUid, timezone, birthdate, premature_weeks: prematureWeeks, bedtime_hour: bedtimeHour, wake_hour: wakeHour };
 
+/** Camera state event fields get_raw_events passes through; everything else (signed video links etc.) is dropped. */
+const STATE_EVENT_FIELDS = ['uid', 'key', 'title', 'time', 'begin_ts', 'end_ts', 'duration', 'last_state_duration', 'confidence', 'source', 'camera_uid', 'created_at'];
+
+/** Shallow copy of a calendar entry without any field whose value is (or contains) a link. */
+function dropUrls<T extends object>(entry: T): T {
+  return Object.fromEntries(Object.entries(entry).filter(([, v]) => !/https?:\/\//i.test(JSON.stringify(v) ?? ''))) as T;
+}
+
 interface Ctx {
   session: CallerSession;
   tzOffset: number;
@@ -194,7 +202,7 @@ export function createMcpServer(defaultTimezone: string): McpServer {
       return { messages: types ? messages.filter(m => types.includes(m.type)) : messages };
     });
 
-  tool('get_raw_events', 'Unprocessed Nanit data for a time window: every calendar entry (auto_sleep segments and care events) plus the camera state events (PUT_TO_SLEEP, FELL_ASLEEP, WOKE_UP, VISIT, REMOVED, ...). No scoring or grouping. Max 3 days. State events only reach back about two weeks, and clip/thumbnail URLs are left out.',
+  tool('get_raw_events', 'Unprocessed Nanit data for a time window: every calendar entry (auto_sleep segments and care events) plus the camera state events (PUT_TO_SLEEP, FELL_ASLEEP, WOKE_UP, VISIT, REMOVED, ...). No scoring or grouping. Max 3 days. State events only reach back about two weeks and carry timing fields only (uid, key, title, time, begin_ts, end_ts, duration, last_state_duration, confidence, source, camera_uid, created_at); video, clip and thumbnail links are left out.',
     { baby_uid: babyUid, timezone, start: when, end: when },
     async (a, c) => {
       const start = parseWhen(a.start, c.tzOffset, 'start');
@@ -208,11 +216,11 @@ export function createMcpServer(defaultTimezone: string): McpServer {
       const state_events = raw
         .filter(e => e.time >= start && e.time <= end)
         .sort((x, y) => x.time - y.time)
-        // media_urls holds pre-signed video/thumbnail links; this server is data-only
-        .map(({ media_urls: _media, ...rest }) => rest);
+        // Allowlist: the feed also carries raw_videos/playlist/url/clip_url (pre-signed S3 links); this server is data-only
+        .map(e => Object.fromEntries(STATE_EVENT_FIELDS.filter(k => k in e).map(k => [k, e[k]])));
       return {
         range: { start, end },
-        calendar: [...calendar].sort((x, y) => x.begin_ts - y.begin_ts),
+        calendar: [...calendar].sort((x, y) => x.begin_ts - y.begin_ts).map(dropUrls),
         state_events,
         state_events_available_from: raw.length ? Math.min(...raw.map(e => e.time)) : null,
       };
