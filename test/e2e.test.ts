@@ -13,6 +13,7 @@ let server: Server;
 let base: string;
 const realFetch = globalThis.fetch;
 const nanitCalls: string[] = [];
+const nanitQueries: string[] = [];
 
 const BABY = { uid: 'baby1', id: 1, name: 'Ada', birthdate: '2025-06-01' };
 const PASSWORD = 'hunter2-secret';
@@ -21,6 +22,7 @@ let nightStart = 0;
 function mockNanit(url: string, init?: RequestInit): Response {
   const u = new URL(url);
   nanitCalls.push(`${init?.method ?? 'GET'} ${u.pathname}`);
+  nanitQueries.push(`${u.pathname}${u.search}`);
   const auth = new Headers(init?.headers).get('authorization');
   if (u.pathname === '/login') {
     const b = JSON.parse(String(init!.body));
@@ -41,6 +43,13 @@ function mockNanit(url: string, init?: RequestInit): Response {
       { uid: 'b', baby_uid: 'baby1', type: 'auto_sleep', begin_ts: t + 5 * 3600 + 600, end_ts: t + 11 * 3600, duration: 6 * 3600 - 600, time: t },
       { uid: 'c', baby_uid: 'baby1', type: 'bottle_feed', begin_ts: t, end_ts: t, duration: 0, time: t, feed_amount: 4, thumbnail_url: 'https://bucket.s3.amazonaws.com/x.png?X-Amz-Signature=1' },
     ] });
+  }
+  if (u.pathname === '/babies/baby1/messages') {
+    // Like Nanit: never more than 50, whatever the limit. Newest 45 are SOUND, the 5 oldest TEMPERATURE.
+    const n = Math.min(Number(u.searchParams.get('limit') ?? 100), 50);
+    return Response.json({ messages: Array.from({ length: n }, (_, i) => ({
+      id: i, baby_uid: 'baby1', user_id: 1, type: i < 45 ? 'SOUND' : 'TEMPERATURE', time: nightStart - i * 600, updated_at: '', created_at: '',
+    })) });
   }
   if (u.pathname === '/babies/baby1/events') {
     return Response.json({ events: [
@@ -198,8 +207,30 @@ test('get_raw_events returns calendar + state events, strips signed media links,
   for (const leak of ['signed.example', 'amazonaws.com', 'X-Amz', 'events.nanit.com']) assert.ok(!text.includes(leak), `output contains ${leak}`);
   assert.deepEqual(Object.keys(raw.state_events[0]).sort(), ['camera_uid', 'confidence', 'key', 'time', 'uid']);
   assert.equal(raw.calendar.find((e: any) => e.uid === 'c').feed_amount, 4); // care fields survive the URL scrub
+  assert.equal(raw.state_events_available_from, nightStart + 7200);
+  assert.equal(raw.state_events_truncated, false); // fewer than 500 events means the whole history was served
+  assert.ok(nanitQueries.includes('/babies/baby1/events?limit=500'));
   const tooLong = await callTool(tokens.access_token, 'get_raw_events', { baby_uid: 'baby1', start: date, end: '2099-01-01' });
   assert.equal(tooLong.isError, true);
+});
+
+test('get_sensor_events filters across the newest 50 alerts and caps the limit at what Nanit serves', async () => {
+  const { tokens } = await signIn();
+  const res = await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', limit: 3, type: 'temperature' });
+  assert.ok(!res.isError, res.content?.[0]?.text);
+  const out = JSON.parse(res.content[0].text);
+  // The TEMPERATURE alerts sit below 45 newer SOUND ones; a fetch of only `limit` would find none
+  assert.deepEqual(out.messages.map((m: any) => m.id), [45, 46, 47]);
+  assert.equal(out.available_from, nightStart - 49 * 600);
+  assert.equal(nanitQueries.at(-1), '/babies/baby1/messages?limit=50');
+  const all = JSON.parse((await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1' })).content[0].text);
+  assert.equal(all.messages.length, 50);
+  const tooMany = await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', limit: 200 });
+  assert.equal(tooMany.isError, true);
+  const list = await (await rpc(tokens.access_token, 'tools/list', {})).json() as any;
+  const desc = (n: string) => list.result.tools.find((t: any) => t.name === n).description;
+  assert.match(desc('get_sensor_events'), /newest 50 alerts/);
+  assert.match(desc('get_raw_events'), /newest 500 camera events \(about a week/);
 });
 
 test('refresh token exchange', async () => {

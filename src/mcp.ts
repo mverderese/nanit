@@ -27,6 +27,11 @@ const when = z.union([z.string().max(40), z.number()]);
 
 const scoring = { baby_uid: babyUid, timezone, birthdate, premature_weeks: prematureWeeks, bedtime_hour: bedtimeHour, wake_hour: wakeHour };
 
+// Observed 2026-10-19: /messages returns at most 50 items whatever the limit (500 /events reach about a week).
+// No paging parameter is known for either endpoint, and no open-source Nanit client pages them, so these are the real reach.
+const MESSAGES_MAX = 50;
+const EVENTS_MAX = 500;
+
 /** Camera state event fields get_raw_events passes through; everything else (signed video links etc.) is dropped. */
 const STATE_EVENT_FIELDS = ['uid', 'key', 'title', 'time', 'begin_ts', 'end_ts', 'duration', 'last_state_duration', 'confidence', 'source', 'camera_uid', 'created_at'];
 
@@ -194,15 +199,20 @@ export function createMcpServer(defaultTimezone: string): McpServer {
       return { events, all_types: [...new Set(calendar.map(e => e.type))] };
     });
 
-  tool('get_sensor_events', 'Recent Nanit sound, motion and temperature alerts for the baby, newest first.',
-    { baby_uid: babyUid, timezone, limit: z.number().int().min(1).max(200).optional(), type: z.string().max(40).optional().describe('Comma-separated filter: SOUND, MOTION, TEMPERATURE') },
+  tool('get_sensor_events', `Nanit sound, motion and temperature alerts for the baby, newest first. Nanit only serves its newest ${MESSAGES_MAX} alerts (usually the last few days) and has no paging, so older alerts can't be reached; available_from is the oldest alert time served. The type filter is applied within those ${MESSAGES_MAX}.`,
+    { baby_uid: babyUid, timezone, limit: z.number().int().min(1).max(MESSAGES_MAX).optional(), type: z.string().max(40).optional().describe('Comma-separated filter: SOUND, MOTION, TEMPERATURE') },
     async (a, c) => {
-      const { messages } = await nanit.getMessages(c.session.token, a.baby_uid, a.limit ?? 100);
+      // Always fetch the full window so a type filter isn't starved by a small limit
+      const { messages } = await nanit.getMessages(c.session.token, a.baby_uid, MESSAGES_MAX);
       const types = a.type ? a.type.toUpperCase().split(',').map(t => t.trim()) : null;
-      return { messages: types ? messages.filter(m => types.includes(m.type)) : messages };
+      const matching = types ? messages.filter(m => types.includes(m.type)) : messages;
+      return {
+        messages: matching.slice(0, a.limit ?? MESSAGES_MAX),
+        available_from: messages.length ? Math.min(...messages.map(m => m.time)) : null,
+      };
     });
 
-  tool('get_raw_events', 'Unprocessed Nanit data for a time window: every calendar entry (auto_sleep segments and care events) plus the camera state events (PUT_TO_SLEEP, FELL_ASLEEP, WOKE_UP, VISIT, REMOVED, ...). No scoring or grouping. Max 3 days. State events only reach back about two weeks and carry timing fields only (uid, key, title, time, begin_ts, end_ts, duration, last_state_duration, confidence, source, camera_uid, created_at); video, clip and thumbnail links are left out.',
+  tool('get_raw_events', `Unprocessed Nanit data for a time window: every calendar entry (auto_sleep segments and care events) plus the camera state events (PUT_TO_SLEEP, FELL_ASLEEP, WOKE_UP, VISIT, REMOVED, ...). No scoring or grouping. Max 3 days. State events come from Nanit's newest ${EVENTS_MAX} camera events (about a week back; Nanit has no paging): state_events_available_from is the oldest one served, and state_events_truncated is true when the window starts before it. They carry timing fields only (uid, key, title, time, begin_ts, end_ts, duration, last_state_duration, confidence, source, camera_uid, created_at); video, clip and thumbnail links are left out.`,
     { baby_uid: babyUid, timezone, start: when, end: when },
     async (a, c) => {
       const start = parseWhen(a.start, c.tzOffset, 'start');
@@ -210,7 +220,7 @@ export function createMcpServer(defaultTimezone: string): McpServer {
       if (end <= start || end - start > 3 * 86400) throw new ToolError('end must be after start, within 3 days.');
       const [{ calendar }, feed] = await Promise.all([
         nanit.getCalendarEvents(c.session.token, a.baby_uid, start, end),
-        nanit.getEvents(c.session.token, a.baby_uid, 500),
+        nanit.getEvents(c.session.token, a.baby_uid, EVENTS_MAX),
       ]);
       const raw = ((feed?.events ?? []) as any[]).filter(e => typeof e.time === 'number');
       const state_events = raw
@@ -218,11 +228,14 @@ export function createMcpServer(defaultTimezone: string): McpServer {
         .sort((x, y) => x.time - y.time)
         // Allowlist: the feed also carries raw_videos/playlist/url/clip_url (pre-signed S3 links); this server is data-only
         .map(e => Object.fromEntries(STATE_EVENT_FIELDS.filter(k => k in e).map(k => [k, e[k]])));
+      const availableFrom = raw.length ? Math.min(...raw.map(e => e.time)) : null;
       return {
         range: { start, end },
         calendar: [...calendar].sort((x, y) => x.begin_ts - y.begin_ts).map(dropUrls),
         state_events,
-        state_events_available_from: raw.length ? Math.min(...raw.map(e => e.time)) : null,
+        state_events_available_from: availableFrom,
+        // Fewer than EVENTS_MAX back means Nanit sent its whole history, so nothing was cut off
+        state_events_truncated: raw.length >= EVENTS_MAX && (availableFrom === null || start < availableFrom),
       };
     });
 
