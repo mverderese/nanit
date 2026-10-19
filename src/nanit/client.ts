@@ -169,13 +169,22 @@ export async function getMessages(
 // Sleep data comes from the calendar endpoint (type: "auto_sleep")
 // No separate sleep endpoint exists in the Nanit API.
 
-// Events endpoint - returns events with pre-signed S3 video clip URLs
+// Events endpoint - returns events with pre-signed S3 video clip URLs.
+// Without a window it returns the newest `limit`; with start/end (unix seconds) it returns events in that
+// window, and limit/offset page through it newest-first. Each page comes back oldest-first.
 export async function getEvents(
   token: string,
   babyUid: string,
   limit: number = 50,
+  window?: { start: number; end: number; offset?: number },
 ): Promise<any> {
-  const url = `${baseUrl}/babies/${babyUid}/events?limit=${limit}`;
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (window) {
+    q.set('start', String(window.start));
+    q.set('end', String(window.end));
+    if (window.offset) q.set('offset', String(window.offset));
+  }
+  const url = `${baseUrl}/babies/${babyUid}/events?${q}`;
   const res = await fetch(url, {
     headers: headers(token),
   });
@@ -187,4 +196,27 @@ export async function getEvents(
 
   const data = await res.json();
   return data;
+}
+
+const EVENTS_PAGE = 500;
+
+/**
+ * Every event in [start, end], paged by offset (Nanit keeps the full history; /messages, by contrast,
+ * serves only its newest 50 and ignores paging). `complete` is false if `maxEvents` cut the window short.
+ */
+export async function getEventsInWindow(
+  token: string,
+  babyUid: string,
+  start: number,
+  end: number,
+  maxEvents: number = 10_000,
+): Promise<{ events: any[]; complete: boolean }> {
+  const byUid = new Map<string, any>();
+  for (let offset = 0; offset < maxEvents; offset += EVENTS_PAGE) {
+    const page: any[] = (await getEvents(token, babyUid, EVENTS_PAGE, { start, end, offset }))?.events ?? [];
+    // Keyed by uid: an event logged mid-paging shifts offsets by one, repeating an item rather than losing one
+    for (const e of page) byUid.set(e.uid ?? `${e.key}@${e.time}`, e);
+    if (page.length < EVENTS_PAGE) return { events: [...byUid.values()], complete: true };
+  }
+  return { events: [...byUid.values()], complete: false };
 }

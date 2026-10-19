@@ -26,7 +26,7 @@ fork's web app is gone from this repo; its history and code remain at the link a
 | `get_milestones` | Records, streaks, improvements |
 | `get_regression_alerts` | Worsening sleep patterns |
 | `get_care_events` | Feeds, diaper changes, other non-sleep events |
-| `get_sensor_events` | Sound / motion / temperature alerts |
+| `get_sensor_events` | Sound / motion / temperature alerts for a window (default last 7 days, max 31) |
 | `get_raw_events` | Unprocessed calendar entries + camera state events for a window (max 3 days) |
 
 Scoring tools take optional `timezone`, `birthdate` (defaults to Nanit's), `premature_weeks`, `bedtime_hour`

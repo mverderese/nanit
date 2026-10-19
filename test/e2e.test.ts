@@ -18,6 +18,23 @@ const nanitQueries: string[] = [];
 const BABY = { uid: 'baby1', id: 1, name: 'Ada', birthdate: '2025-06-01' };
 const PASSWORD = 'hunter2-secret';
 let nightStart = 0;
+/** Extra camera history a test can add behind the two default events. */
+let extraEvents: any[] = [];
+
+function allEvents(): any[] {
+  return [
+    {
+      uid: 'e1', key: 'WOKE_UP', time: nightStart + 7200, camera_uid: 'cam1', confidence: 0.9,
+      media_urls: { thumbnail: 'https://signed.example/t.png' },
+      raw_videos: { media_segments: [{ video_url: 'https://nanit-clips.s3.amazonaws.com/v.mp4?X-Amz-Security-Token=abc&X-Amz-Signature=def' }] },
+      playlist: { media_segments: [{ video_url: 'https://nanit-clips.s3.us-east-1.amazonaws.com/p.mp4?X-Amz-Credential=xyz' }] },
+      url: 'https://events.nanit.com/e1.mp4', clip_url: 'https://events.nanit.com/e1-clip.mp4',
+      url_updated_at: nightStart, playlist_updated_at: nightStart, clip_generation_status: 'done',
+    },
+    { uid: 'e2', key: 'VISIT', time: nightStart + 90000 },
+    ...extraEvents,
+  ];
+}
 
 function mockNanit(url: string, init?: RequestInit): Response {
   const u = new URL(url);
@@ -52,17 +69,14 @@ function mockNanit(url: string, init?: RequestInit): Response {
     })) });
   }
   if (u.pathname === '/babies/baby1/events') {
-    return Response.json({ events: [
-      {
-        uid: 'e1', key: 'WOKE_UP', time: nightStart + 7200, camera_uid: 'cam1', confidence: 0.9,
-        media_urls: { thumbnail: 'https://signed.example/t.png' },
-        raw_videos: { media_segments: [{ video_url: 'https://nanit-clips.s3.amazonaws.com/v.mp4?X-Amz-Security-Token=abc&X-Amz-Signature=def' }] },
-        playlist: { media_segments: [{ video_url: 'https://nanit-clips.s3.us-east-1.amazonaws.com/p.mp4?X-Amz-Credential=xyz' }] },
-        url: 'https://events.nanit.com/e1.mp4', clip_url: 'https://events.nanit.com/e1-clip.mp4',
-        url_updated_at: nightStart, playlist_updated_at: nightStart, clip_generation_status: 'done',
-      },
-      { uid: 'e2', key: 'VISIT', time: nightStart + 90000 },
-    ] });
+    // Like Nanit: start/end select a window, limit/offset page it newest-first, each page oldest-first
+    const q = u.searchParams;
+    const lo = q.has('start') ? Number(q.get('start')) : -Infinity;
+    const hi = q.has('end') ? Number(q.get('end')) : Infinity;
+    const offset = Number(q.get('offset') ?? 0);
+    const page = allEvents().filter(e => e.time >= lo && e.time <= hi).sort((x, y) => y.time - x.time)
+      .slice(offset, offset + Number(q.get('limit') ?? 50)).reverse();
+    return Response.json({ events: page });
   }
   return new Response('{}', { status: 404 });
 }
@@ -207,30 +221,67 @@ test('get_raw_events returns calendar + state events, strips signed media links,
   for (const leak of ['signed.example', 'amazonaws.com', 'X-Amz', 'events.nanit.com']) assert.ok(!text.includes(leak), `output contains ${leak}`);
   assert.deepEqual(Object.keys(raw.state_events[0]).sort(), ['camera_uid', 'confidence', 'key', 'time', 'uid']);
   assert.equal(raw.calendar.find((e: any) => e.uid === 'c').feed_amount, 4); // care fields survive the URL scrub
-  assert.equal(raw.state_events_available_from, nightStart + 7200);
-  assert.equal(raw.state_events_truncated, false); // fewer than 500 events means the whole history was served
-  assert.ok(nanitQueries.includes('/babies/baby1/events?limit=500'));
+  assert.equal(raw.state_events_complete, true);
+  assert.ok(nanitQueries.includes(`/babies/baby1/events?limit=500&start=${nightStart}&end=${nightStart + 86400}`));
   const tooLong = await callTool(tokens.access_token, 'get_raw_events', { baby_uid: 'baby1', start: date, end: '2099-01-01' });
   assert.equal(tooLong.isError, true);
 });
 
-test('get_sensor_events filters across the newest 50 alerts and caps the limit at what Nanit serves', async () => {
+// 1200 sensor events every 5 minutes, starting 20 days before last night: 3 pages of /events, all older than the 50 /messages
+function addSensorHistory() {
+  const from = nightStart - 20 * 86400;
+  extraEvents = Array.from({ length: 1200 }, (_, i) => ({
+    uid: `s${i}`, key: i % 100 === 0 ? 'TEMPERATURE' : i % 2 ? 'MOTION' : 'SOUND', time: from + i * 300, source: 'sm',
+    camera_uid: 'cam1', raw_videos: { media_segments: [{ video_url: 'https://nanit-clips.s3.amazonaws.com/s.mp4?X-Amz-Signature=1' }] },
+  }));
+  return from;
+}
+
+test('get_sensor_events pages /events back through a window and filters before the limit', async () => {
   const { tokens } = await signIn();
-  const res = await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', limit: 3, type: 'temperature' });
-  assert.ok(!res.isError, res.content?.[0]?.text);
-  const out = JSON.parse(res.content[0].text);
-  // The TEMPERATURE alerts sit below 45 newer SOUND ones; a fetch of only `limit` would find none
-  assert.deepEqual(out.messages.map((m: any) => m.id), [45, 46, 47]);
-  assert.equal(out.available_from, nightStart - 49 * 600);
-  assert.equal(nanitQueries.at(-1), '/babies/baby1/messages?limit=50');
-  const all = JSON.parse((await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1' })).content[0].text);
-  assert.equal(all.messages.length, 50);
-  const tooMany = await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', limit: 200 });
-  assert.equal(tooMany.isError, true);
-  const list = await (await rpc(tokens.access_token, 'tools/list', {})).json() as any;
-  const desc = (n: string) => list.result.tools.find((t: any) => t.name === n).description;
-  assert.match(desc('get_sensor_events'), /newest 50 alerts/);
-  assert.match(desc('get_raw_events'), /newest 500 camera events \(about a week/);
+  const from = addSensorHistory();
+  try {
+    const res = await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', start: from - 86400, end: from + 10 * 86400, type: 'temperature', limit: 5 });
+    assert.ok(!res.isError, res.content?.[0]?.text);
+    const out = JSON.parse(res.content[0].text);
+    assert.equal(out.total, 12); // every 100th of 1200, including the oldest, which only the third page has
+    assert.deepEqual(out.alerts.map((x: any) => x.uid), ['s1100', 's1000', 's900', 's800', 's700']);
+    assert.ok(out.alerts.every((x: any) => x.type === 'TEMPERATURE' && !('key' in x)));
+    assert.equal(out.complete, true);
+    assert.ok(nanitQueries.some(q => q.includes('offset=1000')));
+    assert.ok(!res.content[0].text.includes('amazonaws.com'));
+
+    const all = JSON.parse((await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', start: from - 86400, end: from + 10 * 86400, limit: 1000 })).content[0].text);
+    assert.equal(all.total, 1200);
+    assert.equal(all.alerts.length, 1000);
+    assert.equal(all.alerts[0].uid, 's1199'); // newest first
+
+    // Default window is the last 7 days: the 50 /messages alerts (not in this mock's /events) are merged in
+    const recent = JSON.parse((await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1' })).content[0].text);
+    assert.equal(recent.total, 50);
+    assert.equal(recent.alerts.filter((x: any) => x.type === 'TEMPERATURE').length, 5);
+
+    assert.equal((await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', limit: 2000 })).isError, true);
+    assert.equal((await callTool(tokens.access_token, 'get_sensor_events', { baby_uid: 'baby1', start: '2026-01-01', end: '2026-03-01' })).isError, true);
+  } finally {
+    extraEvents = [];
+  }
+});
+
+test('get_raw_events pages past 500 camera events in an old window', async () => {
+  const { tokens } = await signIn();
+  const from = addSensorHistory();
+  try {
+    const res = await callTool(tokens.access_token, 'get_raw_events', { baby_uid: 'baby1', start: from, end: from + 3 * 86400 });
+    assert.ok(!res.isError, res.content?.[0]?.text);
+    const raw = JSON.parse(res.content[0].text);
+    assert.equal(raw.state_events.length, 3 * 86400 / 300 + 1);
+    assert.equal(raw.state_events[0].uid, 's0');
+    assert.equal(raw.state_events_complete, true);
+    assert.ok(!res.content[0].text.includes('amazonaws.com'));
+  } finally {
+    extraEvents = [];
+  }
 });
 
 test('refresh token exchange', async () => {

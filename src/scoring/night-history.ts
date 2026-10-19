@@ -3,7 +3,7 @@ import { NanitAuthError } from '../nanit/client.js';
 import * as store from '../cache.js';
 import { applyAnnotation, buildNightSummaries, pickMainNight, scoreNight, type NightSummary } from './sleep-scorer.js';
 import { nightWindowFromDateStr, pastNightDates, nightId, type NightWindow } from './night-windows.js';
-import { getWindowActivity } from './night-activity.js';
+import { getStateFeed, getWindowActivity } from './night-activity.js';
 import type { SleepAnnotation, SleepScoreBreakdown } from './app-types.js';
 
 /**
@@ -95,6 +95,10 @@ export async function scoreWindow(
  */
 export async function loadScoredNights(p: RangeParams): Promise<ScoredNight[]> {
   const dates = pastNightDates(p.days, p.tzOffset, p.beforeDate);
+  // One event fetch back to the oldest night, which every night's activity lookup then shares
+  if (dates.length) {
+    await getStateFeed(p.token, p.babyUid, nightWindowFromDateStr(dates[0], p.bedtimeHour, p.wakeHour, p.tzOffset).start).catch(() => null);
+  }
   const results = await mapWithConcurrency(dates, NANIT_CONCURRENCY, async date => {
     const window = nightWindowFromDateStr(date, p.bedtimeHour, p.wakeHour, p.tzOffset);
     try {

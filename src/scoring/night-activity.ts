@@ -106,35 +106,38 @@ export function wakeCounts(wakes: WakeDetail[]) {
 
 // ===== FETCHING =====
 
-/** Nanit's /events returns the newest N events; 500 reaches back roughly two weeks. */
-const FEED_LIMIT = 500;
 const FEED_TTL_MS = 5 * 60 * 1000;
-const feedCache = new Map<string, { at: number; feed: Promise<{ oldest: number | null; events: StateEvent[] }> }>();
+const feedCache = new Map<string, { at: number; since: number; feed: Promise<{ oldest: number | null; events: StateEvent[] }> }>();
 
-/** The newest ~500 Nanit events for a baby, reduced to state events. Cached for 5 minutes. */
-export function getStateFeed(token: string, babyUid: string): Promise<{ oldest: number | null; events: StateEvent[] }> {
+/**
+ * Nanit state events from `since` until now, paged out of /events (which keeps the whole history).
+ * Cached per baby for 5 minutes; a later call reuses the cache when it reaches back far enough.
+ * `oldest` is how far back the feed is known complete.
+ */
+export function getStateFeed(token: string, babyUid: string, since: number): Promise<{ oldest: number | null; events: StateEvent[] }> {
   const hit = feedCache.get(babyUid);
-  if (hit && Date.now() - hit.at < FEED_TTL_MS) return hit.feed;
-  const feed = nanit.getEvents(token, babyUid, FEED_LIMIT).then((data: any) => {
-    const raw = ((data?.events ?? []) as any[]).filter(e => typeof e.time === 'number');
-    const oldest = raw.length ? Math.min(...raw.map(e => e.time)) : null;
+  if (hit && Date.now() - hit.at < FEED_TTL_MS && hit.since <= since) return hit.feed;
+  const now = Math.floor(Date.now() / 1000);
+  const feed = nanit.getEventsInWindow(token, babyUid, since, now + 60).then(({ events: rawEvents, complete }) => {
+    const raw = rawEvents.filter(e => typeof e.time === 'number');
+    const oldest = complete ? since : raw.length ? Math.min(...raw.map(e => e.time)) : null;
     const events = raw
       .filter(e => (STATE_KEYS as readonly string[]).includes(e.key))
       .map(e => ({ key: e.key as StateKey, time: Math.round(e.time) }))
       .sort((a, b) => a.time - b.time);
     return { oldest, events };
   });
-  feed.catch(() => feedCache.delete(babyUid));
-  feedCache.set(babyUid, { at: Date.now(), feed });
+  feed.catch(() => { if (feedCache.get(babyUid)?.feed === feed) feedCache.delete(babyUid); });
+  feedCache.set(babyUid, { at: Date.now(), since, feed });
   return feed;
 }
 
-// Completed windows are persisted so a night keeps its visit data after it
-// scrolls out of Nanit's event feed.
+// Completed windows are cached so scoring the same night again skips the
+// event fetch.
 
 /**
  * State events for [start, end]. A window counts as covered only if the feed
- * reaches back before it AND the camera logged at least one state event in it
+ * reaches back to it AND the camera logged at least one state event in it
  * (a night with zero events usually means the camera was off or offline).
  */
 export async function getWindowActivity(token: string, babyUid: string, start: number, end: number): Promise<WindowActivity> {
@@ -146,7 +149,7 @@ export async function getWindowActivity(token: string, babyUid: string, start: n
 
   let feed: { oldest: number | null; events: StateEvent[] };
   try {
-    feed = await getStateFeed(token, babyUid);
+    feed = await getStateFeed(token, babyUid, start);
   } catch (err: any) {
     console.log(`[activity] event feed failed: ${err.message}`);
     return { covered: false, events: [] };
