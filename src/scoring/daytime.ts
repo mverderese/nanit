@@ -223,7 +223,7 @@ export async function loadDays(p: DaysParams, dates: string[], expectations?: Na
 
   const [calendar, feed] = await Promise.all([
     nanit.getCalendarEvents(p.token, p.babyUid, start, end),
-    getStateFeed(p.token, p.babyUid).catch(() => ({ oldest: null, events: [] as StateEvent[] })),
+    getStateFeed(p.token, p.babyUid, start).catch(() => ({ oldest: null, events: [] as StateEvent[] })),
   ]);
   const raw = buildNightSummaries(calendar.calendar.filter(e => e.type === 'auto_sleep'));
   const blocks = classifyBlocks(raw, dates, p);

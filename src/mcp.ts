@@ -27,8 +27,18 @@ const when = z.union([z.string().max(40), z.number()]);
 
 const scoring = { baby_uid: babyUid, timezone, birthdate, premature_weeks: prematureWeeks, bedtime_hour: bedtimeHour, wake_hour: wakeHour };
 
+// Probed 2026-10-19: /messages serves only its newest 50 alerts and ignores every paging parameter, while /events
+// keeps the whole history and pages by start/end + offset. Its SOUND/MOTION entries include every /messages alert.
+const MESSAGES_MAX = 50;
+const SENSOR_KEYS = ['SOUND', 'MOTION', 'TEMPERATURE'];
+
 /** Camera state event fields get_raw_events passes through; everything else (signed video links etc.) is dropped. */
 const STATE_EVENT_FIELDS = ['uid', 'key', 'title', 'time', 'begin_ts', 'end_ts', 'duration', 'last_state_duration', 'confidence', 'source', 'camera_uid', 'created_at'];
+
+/** Allowlisted copy of a camera event: drops raw_videos/playlist/url/clip_url (pre-signed S3 links); this server is data-only. */
+function pickStateFields(e: any): Record<string, unknown> {
+  return Object.fromEntries(STATE_EVENT_FIELDS.filter(k => k in e).map(k => [k, e[k]]));
+}
 
 /** Shallow copy of a calendar entry without any field whose value is (or contains) a link. */
 function dropUrls<T extends object>(entry: T): T {
@@ -194,15 +204,32 @@ export function createMcpServer(defaultTimezone: string): McpServer {
       return { events, all_types: [...new Set(calendar.map(e => e.type))] };
     });
 
-  tool('get_sensor_events', 'Recent Nanit sound, motion and temperature alerts for the baby, newest first.',
-    { baby_uid: babyUid, timezone, limit: z.number().int().min(1).max(200).optional(), type: z.string().max(40).optional().describe('Comma-separated filter: SOUND, MOTION, TEMPERATURE') },
+  tool('get_sensor_events', 'Nanit sound, motion and temperature alerts for the baby between `start` and `end` (YYYY-MM-DD, ISO datetime, or unix seconds; default the last 7 days, max 31 days), newest first. Reaches back to the start of the camera history. The type filter is applied before `limit`; `total` is the number of matching alerts in the window.',
+    { baby_uid: babyUid, timezone, start: when.optional(), end: when.optional(), limit: z.number().int().min(1).max(1000).optional(), type: z.string().max(40).optional().describe('Comma-separated filter: SOUND, MOTION, TEMPERATURE') },
     async (a, c) => {
-      const { messages } = await nanit.getMessages(c.session.token, a.baby_uid, a.limit ?? 100);
-      const types = a.type ? a.type.toUpperCase().split(',').map(t => t.trim()) : null;
-      return { messages: types ? messages.filter(m => types.includes(m.type)) : messages };
+      const end = a.end === undefined ? Math.floor(Date.now() / 1000) : parseWhen(a.end, c.tzOffset, 'end');
+      const start = a.start === undefined ? end - 7 * 86400 : parseWhen(a.start, c.tzOffset, 'start');
+      if (end <= start || end - start > 31 * 86400) throw new ToolError('end must be after start, within 31 days.');
+      const types = a.type ? a.type.toUpperCase().split(',').map(t => t.trim()) : SENSOR_KEYS;
+      const [feed, { messages }] = await Promise.all([
+        nanit.getEventsInWindow(c.session.token, a.baby_uid, start, end),
+        // /events carries every alert seen so far; /messages is a cheap check for alert kinds it might not
+        nanit.getMessages(c.session.token, a.baby_uid, MESSAGES_MAX),
+      ]);
+      const alerts: Array<Record<string, unknown> & { type: string; time: number }> = feed.events
+        .filter(e => typeof e.time === 'number' && e.time >= start && e.time <= end && SENSOR_KEYS.includes(e.key))
+        .map(e => { const { key, ...rest } = pickStateFields(e); return { type: key as string, ...rest, time: e.time as number }; });
+      const seen = new Set(alerts.map(x => `${x.type}@${Math.round(x.time)}`));
+      for (const m of messages) {
+        if (m.time >= start && m.time <= end && !seen.has(`${m.type}@${Math.round(m.time)}`)) {
+          alerts.push({ type: m.type, uid: String(m.id), time: m.time, created_at: m.created_at });
+        }
+      }
+      const matching = alerts.filter(x => types.includes(x.type)).sort((x, y) => y.time - x.time);
+      return { range: { start, end }, total: matching.length, alerts: matching.slice(0, a.limit ?? 100), complete: feed.complete };
     });
 
-  tool('get_raw_events', 'Unprocessed Nanit data for a time window: every calendar entry (auto_sleep segments and care events) plus the camera state events (PUT_TO_SLEEP, FELL_ASLEEP, WOKE_UP, VISIT, REMOVED, ...). No scoring or grouping. Max 3 days. State events only reach back about two weeks and carry timing fields only (uid, key, title, time, begin_ts, end_ts, duration, last_state_duration, confidence, source, camera_uid, created_at); video, clip and thumbnail links are left out.',
+  tool('get_raw_events', 'Unprocessed Nanit data for a time window: every calendar entry (auto_sleep segments and care events) plus every camera event (PUT_TO_SLEEP, FELL_ASLEEP, WOKE_UP, VISIT, REMOVED, SOUND, MOTION, ...), back to the start of the camera history. No scoring or grouping. Max 3 days. Camera events carry timing fields only (uid, key, title, time, begin_ts, end_ts, duration, last_state_duration, confidence, source, camera_uid, created_at); video, clip and thumbnail links are left out.',
     { baby_uid: babyUid, timezone, start: when, end: when },
     async (a, c) => {
       const start = parseWhen(a.start, c.tzOffset, 'start');
@@ -210,19 +237,17 @@ export function createMcpServer(defaultTimezone: string): McpServer {
       if (end <= start || end - start > 3 * 86400) throw new ToolError('end must be after start, within 3 days.');
       const [{ calendar }, feed] = await Promise.all([
         nanit.getCalendarEvents(c.session.token, a.baby_uid, start, end),
-        nanit.getEvents(c.session.token, a.baby_uid, 500),
+        nanit.getEventsInWindow(c.session.token, a.baby_uid, start, end),
       ]);
-      const raw = ((feed?.events ?? []) as any[]).filter(e => typeof e.time === 'number');
-      const state_events = raw
-        .filter(e => e.time >= start && e.time <= end)
+      const state_events = feed.events
+        .filter(e => typeof e.time === 'number' && e.time >= start && e.time <= end)
         .sort((x, y) => x.time - y.time)
-        // Allowlist: the feed also carries raw_videos/playlist/url/clip_url (pre-signed S3 links); this server is data-only
-        .map(e => Object.fromEntries(STATE_EVENT_FIELDS.filter(k => k in e).map(k => [k, e[k]])));
+        .map(pickStateFields);
       return {
         range: { start, end },
         calendar: [...calendar].sort((x, y) => x.begin_ts - y.begin_ts).map(dropUrls),
         state_events,
-        state_events_available_from: raw.length ? Math.min(...raw.map(e => e.time)) : null,
+        state_events_complete: feed.complete,
       };
     });
 
